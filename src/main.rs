@@ -18,25 +18,53 @@ fn is_on_unc_path() -> bool {
     matches!(prefix.kind(), Prefix::UNC(_, _) | Prefix::VerbatimUNC(_, _))
 }
 
-fn find_executable(command: &str) -> Option<PathBuf> {
+struct Extension {
+    suffix: &'static str,
+    support_unc: bool,
+}
+
+fn find_executable(command: &str) -> Result<PathBuf, String> {
     if Path::new(command).extension().is_some() {
-        return which::which(command).ok();
+        return which::which(command).map_err(|_| format!("Command '{}' not found", command));
     }
 
-    let extensions = if is_on_unc_path() {
-        [".exe"].as_slice()
-    } else {
-        [".exe", ".bat", ".cmd"].as_slice()
-    };
+    let is_unc = is_on_unc_path();
+    let extensions = [
+        Extension {
+            suffix: ".exe",
+            support_unc: true,
+        },
+        Extension {
+            suffix: ".bat",
+            support_unc: false,
+        },
+        Extension {
+            suffix: ".cmd",
+            support_unc: false,
+        },
+    ];
 
-    for &ext in extensions {
-        let candidate = format!("{}{}", command, ext);
+    let mut found_unsupported = None;
+
+    for ext in &extensions {
+        let candidate = format!("{}{}", command, ext.suffix);
         if let Ok(path) = which::which(&candidate) {
-            return Some(path);
+            if !ext.support_unc && is_unc {
+                found_unsupported = Some(path);
+            } else {
+                return Ok(path);
+            }
         }
     }
 
-    None
+    if let Some(path) = found_unsupported {
+        return Err(format!(
+            "Command '{}' found but cannot be executed from UNC path (network drive). Use .exe files or run from a local drive.",
+            path.display()
+        ));
+    }
+
+    Err(format!("Command '{}' not found", command))
 }
 
 fn main() -> ExitCode {
@@ -46,9 +74,12 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let Some(exe) = find_executable(&args[1]) else {
-        eprintln!("Error: Command '{}' not found", args[1]);
-        return ExitCode::FAILURE;
+    let exe = match find_executable(&args[1]) {
+        Ok(path) => path,
+        Err(msg) => {
+            eprintln!("Error: {}", msg);
+            return ExitCode::FAILURE;
+        }
     };
 
     let mut child = match Command::new(&exe).args(&args[2..]).spawn() {

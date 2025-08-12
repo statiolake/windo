@@ -1,9 +1,11 @@
 use std::{
     env,
+    fs,
     io::{self, BufRead, BufReader, Write},
-    path::{Component, Path, PathBuf, Prefix},
+    path::{Path, PathBuf},
     process::{Command, ExitCode, ExitStatus, Stdio},
 };
+
 
 fn is_on_unc_path() -> bool {
     let Ok(current_dir) = env::current_dir() else {
@@ -11,44 +13,54 @@ fn is_on_unc_path() -> bool {
         return true;
     };
 
-    let canonical_dir = current_dir.canonicalize().unwrap_or(current_dir);
-    let Some(Component::Prefix(prefix)) = canonical_dir.components().next() else {
-        return false;
+    // In WSL, resolve symlinks to get the actual path
+    let canonical_dir = match fs::read_link(&current_dir) {
+        Ok(link_target) => link_target,
+        Err(_) => current_dir.clone(),
     };
 
-    matches!(prefix.kind(), Prefix::UNC(_, _) | Prefix::VerbatimUNC(_, _))
+    // Check if the path starts with /mnt/{drive_letter}
+    // If not, it's likely a UNC path when accessed from Windows
+    let path_str = canonical_dir.to_string_lossy();
+    
+    // UNC path pattern: not starting with /mnt/ followed by a single letter
+    !path_str.starts_with("/mnt/") || 
+    !path_str.chars().nth(5).map_or(false, |c| c.is_ascii_alphabetic()) ||
+    !path_str.chars().nth(6).map_or(false, |c| c == '/')
 }
 
 struct Configuration {
     path: PathBuf,
     pipe: bool,
+    needs_cmd_wrapper: bool,
 }
 
 fn find_configuration(command: &str) -> Result<Configuration, String> {
     if Path::new(command).extension().is_some() {
         let path = which::which(command).map_err(|_| format!("Command '{}' not found", command))?;
-        return Ok(Configuration { path, pipe: false });
+        let needs_cmd_wrapper = command.ends_with(".bat") || command.ends_with(".cmd");
+        return Ok(Configuration { path, pipe: needs_cmd_wrapper, needs_cmd_wrapper });
     }
 
     struct SupportedExecutable {
         suffix: &'static str,
-        support_unc: bool,
+        needs_cmd_wrapper: bool,
         pipe: bool,
     }
     let supported = [
         SupportedExecutable {
             suffix: ".exe",
-            support_unc: true,
+            needs_cmd_wrapper: false,
             pipe: false,
         },
         SupportedExecutable {
             suffix: ".bat",
-            support_unc: false,
+            needs_cmd_wrapper: true,
             pipe: true,
         },
         SupportedExecutable {
             suffix: ".cmd",
-            support_unc: false,
+            needs_cmd_wrapper: true,
             pipe: true,
         },
     ];
@@ -60,15 +72,17 @@ fn find_configuration(command: &str) -> Result<Configuration, String> {
     for ext in &supported {
         let candidate = format!("{}{}", command, ext.suffix);
         if let Ok(path) = which::which(&candidate) {
-            if !ext.support_unc && is_unc {
+            if ext.needs_cmd_wrapper && is_unc {
                 found_unsupported = Some(Configuration {
                     path,
                     pipe: ext.pipe,
+                    needs_cmd_wrapper: ext.needs_cmd_wrapper,
                 });
             } else {
                 return Ok(Configuration {
                     path,
                     pipe: ext.pipe,
+                    needs_cmd_wrapper: ext.needs_cmd_wrapper,
                 });
             }
         }
@@ -100,8 +114,28 @@ fn main() -> ExitCode {
     };
 
     let status: ExitStatus = if exe.pipe {
-        let mut child = match Command::new(&exe.path)
-            .args(&args[2..])
+        let mut command = if exe.needs_cmd_wrapper {
+            let mut cmd = Command::new("cmd.exe");
+            cmd.arg("/c");
+            
+            // Convert WSL path to Windows path using wslpath
+            let windows_path = Command::new("wslpath")
+                .arg("-w")
+                .arg(&exe.path)
+                .output()
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+                .unwrap_or_else(|_| exe.path.display().to_string());
+                
+            cmd.arg(windows_path);
+            cmd.args(&args[2..]);
+            cmd
+        } else {
+            let mut cmd = Command::new(&exe.path);
+            cmd.args(&args[2..]);
+            cmd
+        };
+        
+        let mut child = match command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -155,7 +189,28 @@ fn main() -> ExitCode {
 
         status
     } else {
-        let mut child = match Command::new(&exe.path).args(&args[2..]).spawn() {
+        let mut command = if exe.needs_cmd_wrapper {
+            let mut cmd = Command::new("cmd.exe");
+            cmd.arg("/c");
+            
+            // Convert WSL path to Windows path using wslpath
+            let windows_path = Command::new("wslpath")
+                .arg("-w")
+                .arg(&exe.path)
+                .output()
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+                .unwrap_or_else(|_| exe.path.display().to_string());
+                
+            cmd.arg(windows_path);
+            cmd.args(&args[2..]);
+            cmd
+        } else {
+            let mut cmd = Command::new(&exe.path);
+            cmd.args(&args[2..]);
+            cmd
+        };
+        
+        let mut child = match command.spawn() {
             Ok(child) => child,
             Err(e) => {
                 eprintln!("Error starting '{}': {}", exe.path.display(), e);

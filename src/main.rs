@@ -1,32 +1,33 @@
 use std::{
-    env,
-    fs,
+    env, fs,
     io::{self, BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    process::{Command, ExitCode, ExitStatus, Stdio},
+    process::{Command, ExitCode, Stdio},
+    thread,
 };
 
+use regex::Regex;
 
 fn is_on_unc_path() -> bool {
     let Ok(current_dir) = env::current_dir() else {
-        // Some unexpected directory, fall back to true
+        // Some unexpected directory. Considering it as a UNC path for safety.
         return true;
     };
 
-    // In WSL, resolve symlinks to get the actual path
+    // Resolve symlinks to get the actual path
     let canonical_dir = match fs::read_link(&current_dir) {
         Ok(link_target) => link_target,
-        Err(_) => current_dir.clone(),
+        Err(_) => current_dir,
     };
 
     // Check if the path starts with /mnt/{drive_letter}
     // If not, it's likely a UNC path when accessed from Windows
+    // TODO: you can check UNC paths more robustly to use wslpath and UNC path pattern, but in my
+    // simple use case, this is enough.
+    let mnt_dir_pattern = Regex::new(r"^/mnt/[a-zA-Z]/").unwrap();
     let path_str = canonical_dir.to_string_lossy();
-    
-    // UNC path pattern: not starting with /mnt/ followed by a single letter
-    !path_str.starts_with("/mnt/") || 
-    !path_str.chars().nth(5).map_or(false, |c| c.is_ascii_alphabetic()) ||
-    !path_str.chars().nth(6).map_or(false, |c| c == '/')
+
+    !mnt_dir_pattern.is_match(&path_str)
 }
 
 struct Configuration {
@@ -38,8 +39,11 @@ struct Configuration {
 fn find_configuration(command: &str) -> Result<Configuration, String> {
     if Path::new(command).extension().is_some() {
         let path = which::which(command).map_err(|_| format!("Command '{}' not found", command))?;
-        let needs_cmd_wrapper = command.ends_with(".bat") || command.ends_with(".cmd");
-        return Ok(Configuration { path, pipe: needs_cmd_wrapper, needs_cmd_wrapper });
+        return Ok(Configuration {
+            path,
+            pipe: false,
+            needs_cmd_wrapper: false,
+        });
     }
 
     struct SupportedExecutable {
@@ -47,6 +51,7 @@ fn find_configuration(command: &str) -> Result<Configuration, String> {
         needs_cmd_wrapper: bool,
         pipe: bool,
     }
+
     let supported = [
         SupportedExecutable {
             suffix: ".exe",
@@ -68,7 +73,6 @@ fn find_configuration(command: &str) -> Result<Configuration, String> {
     let is_unc = is_on_unc_path();
 
     let mut found_unsupported = None;
-
     for ext in &supported {
         let candidate = format!("{}{}", command, ext.suffix);
         if let Ok(path) = which::which(&candidate) {
@@ -90,7 +94,7 @@ fn find_configuration(command: &str) -> Result<Configuration, String> {
 
     if let Some(exe) = found_unsupported {
         return Err(format!(
-            "Command '{}' found but cannot be executed from UNC path (network drive). Use .exe files or run from a local drive.",
+            "Note: Command '{}' found but cannot be executed from UNC path (network drive). Use .exe files or run from a local drive.",
             exe.path.display()
         ));
     }
@@ -98,59 +102,48 @@ fn find_configuration(command: &str) -> Result<Configuration, String> {
     Err(format!("Command '{}' not found", command))
 }
 
-fn main() -> ExitCode {
+fn execute() -> Result<ExitCode, String> {
     let args = env::args().collect::<Vec<String>>();
     if args.len() < 2 {
         eprintln!("Usage: {} <command> [args...]", args[0]);
-        return ExitCode::FAILURE;
+        return Err("No command provided".to_string());
     }
 
-    let exe = match find_configuration(&args[1]) {
-        Ok(path) => path,
-        Err(msg) => {
-            eprintln!("Error: {}", msg);
-            return ExitCode::FAILURE;
-        }
+    let config = find_configuration(&args[1])?;
+
+    let mut cmd = if config.needs_cmd_wrapper {
+        let mut cmd = Command::new("cmd.exe");
+        cmd.arg("/c");
+        let windows_binary_path = Command::new("wslpath")
+            .arg("-w")
+            .arg(&config.path)
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .map_err(|e| format!("Failed to convert path: {}", e))?;
+
+        cmd.arg(windows_binary_path);
+        cmd
+    } else {
+        Command::new(&config.path)
     };
 
-    let status: ExitStatus = if exe.pipe {
-        let mut command = if exe.needs_cmd_wrapper {
-            let mut cmd = Command::new("cmd.exe");
-            cmd.arg("/c");
-            
-            // Convert WSL path to Windows path using wslpath
-            let windows_path = Command::new("wslpath")
-                .arg("-w")
-                .arg(&exe.path)
-                .output()
-                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-                .unwrap_or_else(|_| exe.path.display().to_string());
-                
-            cmd.arg(windows_path);
-            cmd.args(&args[2..]);
-            cmd
-        } else {
-            let mut cmd = Command::new(&exe.path);
-            cmd.args(&args[2..]);
-            cmd
-        };
-        
-        let mut child = match command
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(e) => {
-                eprintln!("Error starting '{}': {}", exe.path.display(), e);
-                return ExitCode::FAILURE;
-            }
-        };
+    cmd.args(&args[2..]);
 
+    if config.pipe {
+        // If the command is piped, we need to set up the command to capture stdout and stderr
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Error starting '{}': {}", config.path.display(), e))?;
+
+    let mut join_handles = vec![];
+    if config.pipe {
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
 
-        let stdout_handle = std::thread::spawn(move || {
+        let stdout_handle = thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             let mut line = String::new();
             while let Ok(n) = reader.read_line(&mut line) {
@@ -163,7 +156,7 @@ fn main() -> ExitCode {
             }
         });
 
-        let stderr_handle = std::thread::spawn(move || {
+        let stderr_handle = thread::spawn(move || {
             let mut reader = BufReader::new(stderr);
             let mut line = String::new();
             while let Ok(n) = reader.read_line(&mut line) {
@@ -176,56 +169,25 @@ fn main() -> ExitCode {
             }
         });
 
-        let status = match child.wait() {
-            Ok(status) => status,
-            Err(e) => {
-                eprintln!("Error waiting for '{}': {}", exe.path.display(), e);
-                return ExitCode::FAILURE;
-            }
-        };
+        join_handles.push(stdout_handle);
+        join_handles.push(stderr_handle);
+    }
 
-        stdout_handle.join().unwrap();
-        stderr_handle.join().unwrap();
+    let status = child
+        .wait()
+        .map_err(|e| format!("Error waiting for '{}': {}", config.path.display(), e))?;
 
-        status
-    } else {
-        let mut command = if exe.needs_cmd_wrapper {
-            let mut cmd = Command::new("cmd.exe");
-            cmd.arg("/c");
-            
-            // Convert WSL path to Windows path using wslpath
-            let windows_path = Command::new("wslpath")
-                .arg("-w")
-                .arg(&exe.path)
-                .output()
-                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-                .unwrap_or_else(|_| exe.path.display().to_string());
-                
-            cmd.arg(windows_path);
-            cmd.args(&args[2..]);
-            cmd
-        } else {
-            let mut cmd = Command::new(&exe.path);
-            cmd.args(&args[2..]);
-            cmd
-        };
-        
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(e) => {
-                eprintln!("Error starting '{}': {}", exe.path.display(), e);
-                return ExitCode::FAILURE;
-            }
-        };
+    join_handles.into_iter().for_each(|h| h.join().unwrap());
 
-        match child.wait() {
-            Ok(status) => status,
-            Err(e) => {
-                eprintln!("Error waiting for '{}': {}", exe.path.display(), e);
-                return ExitCode::FAILURE;
-            }
+    Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
+}
+
+fn main() -> ExitCode {
+    match execute() {
+        Ok(exit_code) => exit_code,
+        Err(msg) => {
+            eprintln!("Error: {}", msg);
+            ExitCode::FAILURE
         }
-    };
-
-    ExitCode::from(status.code().unwrap_or(1) as u8)
+    }
 }
